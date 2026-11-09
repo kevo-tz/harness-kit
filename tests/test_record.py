@@ -8,6 +8,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -69,8 +70,12 @@ class Record(unittest.TestCase):
         """A subagent transcript (JSONL) like Claude Code writes; each entry is (role, content)."""
         path = os.path.join(self.parent, "agent.jsonl")
         with open(path, "w") as f:
-            for role, content in entries:
-                f.write(json.dumps({"type": role, "message": {"role": role, "content": content}}) + "\n")
+            for entry in entries:
+                role, content, *rest = entry  # an optional third item is the message id
+                message = {"role": role, "content": content}
+                if rest:
+                    message["id"] = rest[0]
+                f.write(json.dumps({"type": role, "message": message}) + "\n")
         return path
 
     def run_record_from_transcript(self, cwd, path, agent="skeptic"):
@@ -301,6 +306,217 @@ class Record(unittest.TestCase):
         out = self.run_record_from_transcript(self.parent, raw)
         self.assertIn("did not approve", out)
         self.assertFalse(hk.is_approved(self.a))
+
+    # ------------------------------------------------------------ review 2 findings
+
+    def test_a_rejection_whose_reviewed_head_matches_no_repo_still_clears_existing_approvals(self):
+        hk.write_marker(self.a, hk.fingerprint(self.a))
+        tree = hk.fingerprint(self.a).split(":")[1]
+        self.run_record(self.parent, f"VERDICT: rejected\nREVIEWED: deadbeef:{tree}\nFINDINGS:\n- [blocker] x:1 - bad")
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_a_truncated_last_line_is_no_report_even_after_an_earlier_approval(self):
+        fp = hk.fingerprint(self.a)
+        path = self.transcript(("assistant", [{"type": "text", "text": verdict("approved", fp)}], "m1"))
+        with open(path, "a") as f:
+            f.write('{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"SubagentHandback","input":{"message":"VERDI')
+        out = self.run_record_from_transcript(self.parent, path)
+        self.assertIn("did not approve", out)
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_the_text_lines_of_the_final_message_are_read_together(self):
+        fp = hk.fingerprint(self.a)
+        split = self.transcript(
+            ("assistant", [{"type": "thinking", "thinking": "hm"}], "m2"),
+            ("assistant", [{"type": "text", "text": "FINDINGS:\n- [major] a:1 - broken"}], "m2"),
+            ("assistant", [{"type": "text", "text": verdict("approved", fp)}], "m2"),
+        )
+        out = self.run_record_from_transcript(self.parent, split)
+        self.assertIn("did not approve", out)  # the major finding is in the same message
+        self.assertFalse(hk.is_approved(self.a))
+        # in the required order, the same split report is approved
+        ordered = self.transcript(
+            ("assistant", [{"type": "thinking", "thinking": "hm"}], "m3"),
+            ("assistant", [{"type": "text", "text": f"VERDICT: approved\nREVIEWED: {fp}"}], "m3"),
+            ("assistant", [{"type": "text", "text": "FINDINGS:\n- [minor] x:1 - nit"}], "m3"),
+        )
+        self.run_record_from_transcript(self.parent, ordered)
+        self.assertTrue(hk.is_approved(self.a))
+
+    def test_an_earlier_message_is_not_joined_to_the_final_one(self):
+        fp = hk.fingerprint(self.a)
+        path = self.transcript(
+            ("assistant", [{"type": "text", "text": "FINDINGS:\n- [major] a:1 - broken"}], "old"),
+            ("user", [{"type": "tool_result", "content": "ok"}]),
+            ("assistant", [{"type": "text", "text": verdict("approved", fp)}], "new"),
+        )
+        self.run_record_from_transcript(self.parent, path)
+        self.assertTrue(hk.is_approved(self.a))
+
+    def test_a_final_message_that_also_made_a_tool_call_is_not_a_finished_report(self):
+        # Claude Code writes the text block of a message BEFORE its tool_use block (one line each, one id).
+        fp = hk.fingerprint(self.a)
+        text = ("assistant", [{"type": "text", "text": verdict("approved", fp)}], "m4")
+        call = ("assistant", [{"type": "tool_use", "name": "Bash", "input": {}}], "m4")
+        for entries in (
+            (text, call),                                                         # ends in the tool call
+            (text, call, ("user", [{"type": "tool_result", "content": "x"}])),   # and its result
+            (call, text),                                                         # the reverse order too
+            (("assistant", [{"type": "thinking", "thinking": "hm"}], "m4"), text, call),
+        ):
+            out = self.run_record_from_transcript(self.parent, self.transcript(*entries))
+            self.assertIn("did not approve", out)
+            self.assertFalse(hk.is_approved(self.a))
+
+    def test_a_string_content_line_of_the_final_message_is_joined_too(self):
+        fp = hk.fingerprint(self.a)
+        path = self.transcript(
+            ("assistant", f"VERDICT: approved\nREVIEWED: {fp}", "m5"),
+            ("assistant", [{"type": "text", "text": "FINDINGS:\n- [major] a:1 - broken"}], "m5"),
+        )
+        out = self.run_record_from_transcript(self.parent, path)
+        self.assertIn("did not approve", out)
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_the_same_fingerprint_quoted_twice_is_fine_but_two_different_ones_are_not(self):
+        fp = hk.fingerprint(self.a)
+        self.run_record(self.parent, f"VERDICT: approved\nREVIEWED: {fp}\nREVIEWED: {fp}\nFINDINGS:\n")
+        self.assertTrue(hk.is_approved(self.a))
+
+    # ------------------------------------------------------------ review 3: real transcript shapes
+
+    def write_lines(self, *lines):
+        """Raw JSONL lines: a dict is dumped, a str is written as is."""
+        path = os.path.join(self.parent, "raw-shape.jsonl")
+        with open(path, "w") as f:
+            for line in lines:
+                f.write((line if isinstance(line, str) else json.dumps(line)) + "\n")
+        return path
+
+    @staticmethod
+    def msg(blocks, mid="X", role="assistant", stop=None):
+        message = {"role": role, "id": mid, "content": blocks}
+        if stop:
+            message["stop_reason"] = stop
+        return {"type": role, "message": message}
+
+    RESULT = {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}}
+    ATTACHMENT = {"type": "attachment", "attachment": {"type": "hook_success"}}
+
+    def refused(self, *lines):
+        out = self.run_record_from_transcript(self.parent, self.write_lines(*lines))
+        self.assertIn("did not approve", out)
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_tool_results_and_attachments_can_sit_between_lines_of_one_message(self):
+        fp = hk.fingerprint(self.a)
+        approved = self.msg([{"type": "text", "text": verdict("approved", fp)}])
+        # a tool call earlier in the same message, a result in between, then the approved text
+        self.refused(self.msg([{"type": "tool_use", "name": "Read", "input": {}}]), self.RESULT, approved)
+        # a major finding in one text line, an attachment, then the approved verdict in the same message
+        self.refused(self.msg([{"type": "text", "text": "FINDINGS:\n- [major] a:1 - bad"}]), self.ATTACHMENT, approved)
+        # the legitimate shape: thinking, text lines and attachments of ONE message are joined and approved
+        path = self.write_lines(
+            self.msg([{"type": "thinking", "thinking": "hm"}]), self.ATTACHMENT,
+            self.msg([{"type": "text", "text": f"VERDICT: approved\nREVIEWED: {fp}\nFINDINGS:"}]), self.ATTACHMENT,
+            self.msg([{"type": "text", "text": "- [minor] x:1 - nit"}]))
+        self.run_record_from_transcript(self.parent, path)
+        self.assertTrue(hk.is_approved(self.a))
+
+    def test_an_interrupted_server_tool_call_after_approved_text_is_refused(self):
+        fp = hk.fingerprint(self.a)
+        self.refused(self.msg([{"type": "text", "text": verdict("approved", fp)}]),
+                     self.msg([{"type": "server_tool_use", "name": "advisor", "input": {}}]))
+
+    def test_the_real_advisor_then_handback_shape_is_a_finished_report(self):
+        # A skeptic that consulted the advisor writes it all into the message that ends in its handback.
+        fp = hk.fingerprint(self.a)
+        path = self.write_lines(
+            self.msg([{"type": "thinking", "thinking": "hm"}], stop="tool_use"),
+            self.msg([{"type": "server_tool_use", "name": "advisor", "input": {}}], stop="tool_use"),
+            self.msg([{"type": "advisor_tool_result", "content": "advice"}], stop="tool_use"),
+            self.msg([{"type": "thinking", "thinking": "ok"}], stop="tool_use"),
+            self.msg([{"type": "tool_use", "name": "SubagentHandback", "input": {"message": verdict("approved", fp)}}],
+                     stop="tool_use"),
+            self.RESULT, self.ATTACHMENT, self.ATTACHMENT)
+        self.run_record_from_transcript(self.parent, path)
+        self.assertTrue(hk.is_approved(self.a))
+
+    def test_another_tool_call_beside_the_handback_is_refused(self):
+        fp = hk.fingerprint(self.a)
+        handback = {"type": "tool_use", "name": "SubagentHandback", "input": {"message": verdict("approved", fp)}}
+        bash = {"type": "tool_use", "name": "Bash", "input": {}}
+        self.refused(self.msg([bash, handback]))                                       # one line, both
+        self.refused(self.msg([bash]), self.RESULT, self.msg([handback]), self.RESULT)  # parallel calls
+        self.refused(self.msg([handback]), self.msg([{"type": "text", "text": "Done."}]))  # speaks after it
+
+    def test_a_last_line_that_is_json_but_not_an_object_is_unreadable(self):
+        fp = hk.fingerprint(self.a)
+        approved = self.msg([{"type": "text", "text": verdict("approved", fp)}])
+        self.refused(approved, "[1, 2]")
+        self.refused(approved, "null")
+        self.refused(approved, '"a string"')
+
+    def test_a_text_report_whose_message_stopped_to_call_a_tool_is_refused(self):
+        fp = hk.fingerprint(self.a)
+        self.refused(self.msg([{"type": "text", "text": verdict("approved", fp)}], stop="tool_use"))
+
+    def test_more_than_one_reviewed_line_is_refused(self):
+        fp = hk.fingerprint(self.a)
+        out = self.run_record(self.parent, f"VERDICT: approved\nREVIEWED: 0000:1111\nREVIEWED: {fp}\nFINDINGS:\n")
+        self.assertIn("differs from what it reviewed", out)
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_serious_findings_are_seen_in_every_common_format(self):
+        fp = hk.fingerprint(self.a)
+        for finding in ("- **[major]** x:1 - bad", "1. [major] x:1 - bad", "2) [blocker] x:1 - bad",
+                        "* [Blocker] x:1 - bad", "  - `[major]` x:1 - bad", "+ [MAJOR] x:1 - bad",
+                        "> - [major] x:1 - bad", "\u2022 [major] x:1 - bad", "| [major] | x:1 | bad |",
+                        "[blocker] x:1 - bad", "-   __[Major]__ x:1 - bad",
+                        "\u2013 [major] x:1 - bad", "\u2014 [major] x:1 - bad", "### [major] x:1 - bad",
+                        "FINDINGS: - [major] x:1 - bad", "- \U0001F534 [major] x:1 - bad",
+                        "\u25aa [major] x:1 - bad", "- [ major ] x:1 - bad", "\u200b[major] x:1 - bad"):
+            out = self.run_record(self.parent, verdict("approved", fp, finding))
+            self.assertIn("did not approve", out, finding)
+            self.assertFalse(hk.is_approved(self.a), finding)
+        for finding in ("- [minor] x:1 - nit", "- **[minor]** x:1 - nit", "1. [minor] x:1 - nit",
+                        "A [major] bug was ruled out", "- [minor] x:1 - mentions [major] mid-line",
+                        "There are no [major] findings.", "[minor] x:1 - a first item", "FINDINGS: none",
+                        "- [blocker|major|minor] file:line - template line"):
+            hk.clear_marker(self.a)
+            self.run_record(self.parent, verdict("approved", fp, finding))
+            self.assertTrue(hk.is_approved(self.a), finding)
+
+    def test_a_non_string_message_counts_as_no_report_and_clears_an_existing_approval(self):
+        hk.write_marker(self.a, hk.fingerprint(self.a))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            hk.record({"agent_type": "skeptic", "cwd": self.parent, "last_assistant_message": {"x": 1}})
+        self.assertIn("did not approve", out.getvalue())
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_a_crash_clears_existing_approvals_instead_of_leaving_them(self):
+        hk.write_marker(self.a, hk.fingerprint(self.a))
+        data = json.dumps({"agent_type": "skeptic", "cwd": self.parent})
+        out = io.StringIO()
+        with mock.patch.object(hk, "record", side_effect=RuntimeError("boom")), \
+             mock.patch.object(sys, "argv", ["harness-kit.py", "record"]), \
+             mock.patch.object(sys, "stdin", io.StringIO(data)), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(hk.main(), 0)
+        self.assertIn("the approval hook failed", out.getvalue())
+        self.assertFalse(hk.is_approved(self.a))
+        with open(self.logfile) as f:
+            self.assertIn("record crashed: RuntimeError: boom", f.read())
+        # another kind of agent crashing leaves approvals alone
+        hk.write_marker(self.a, hk.fingerprint(self.a))
+        data = json.dumps({"agent_type": "verifier", "cwd": self.parent})
+        with mock.patch.object(hk, "record", side_effect=RuntimeError("boom")), \
+             mock.patch.object(sys, "argv", ["harness-kit.py", "record"]), \
+             mock.patch.object(sys, "stdin", io.StringIO(data)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hk.main(), 0)
+        self.assertTrue(hk.is_approved(self.a))
 
     def test_every_call_is_logged_without_message_content(self):
         fp = hk.fingerprint(self.a)
