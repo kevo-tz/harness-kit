@@ -1,6 +1,6 @@
 # harness-kit
 
-A multi-model harness for [Claude Code](https://claude.com/claude-code): Sonnet does the work, an Opus advisor weighs in on hard calls, a Haiku **verifier** runs tests, and a Fable **skeptic** must approve every commit.
+A multi-model harness for [Claude Code](https://claude.com/claude-code): Sonnet does the work, an Opus advisor weighs in on hard calls, a Haiku **verifier** runs tests, and an Opus **skeptic** must approve every commit.
 
 ## How the commit gate works
 
@@ -10,6 +10,10 @@ A multi-model harness for [Claude Code](https://claude.com/claude-code): Sonnet 
 4. A `PreToolUse` hook blocks `git commit` (including `sh -c "…"`, `git -C`, aliases) unless the current change is approved, and blocks the agent from writing the approval itself.
 
 The fingerprint is `HEAD` + the tree `git add -A` would produce, so staging doesn't void approval but any edit, new file or commit does. The marker lives in `.git/`, so it is never committed.
+
+A session may be started in a folder that holds several repos (for example `~/Work`). The hook then finds the repo whose current fingerprint equals the one the skeptic reviewed, looking in the session folder and one or two levels below it, so approval can only land on the exact change that was reviewed.
+
+Tests: `python3 -m unittest discover -s tests -v`.
 
 This is a guardrail against an agent skipping steps, not a security boundary.
 

@@ -6,7 +6,7 @@ Do the core work yourself, and use the other roles only as described.
 - **You (main session):** plan, write code, own the task.
 - **Advisor:** if the advisor tool is available, consult it before committing to an approach on anything non-trivial, when the same error recurs, and before declaring the task done. Not for routine edits.
 - **verifier subagent (Haiku):** delegate test runs, lints and builds to it. Never say tests pass unless the verifier reported `RESULT: PASS` with real output.
-- **skeptic subagent (Fable):** adversarial review of the full pending change before every commit.
+- **skeptic subagent (Opus):** adversarial review of the full pending change before every commit.
 
 ## Rules
 1. **Work autonomously.** Permissions run in auto mode, so don't stop to ask before routine edits or commands. Stop and ask me before anything destructive or hard to reverse, or when the goal is ambiguous.
