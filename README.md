@@ -37,4 +37,6 @@ python3 ~/.claude/hooks/harness-kit.py status       # is the current change appr
 python3 ~/.claude/hooks/harness-kit.py approve      # human override, from your own terminal
 ```
 
+The `record` hook re-reads a skeptic transcript that has no `VERDICT` line yet for up to `HARNESS_KIT_RECORD_WAIT` seconds (default 10, at most 50), because Claude Code can run SubagentStop before the final report is written. A skeptic run that never reports (an API error, for example) therefore holds the session for that long before recording nothing.
+
 Not gated: `merge`, `rebase`, `cherry-pick`, `revert` (they replay existing commits rather than new working-tree changes).

@@ -47,6 +47,7 @@ class Record(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.logfile = os.path.join(tempfile.gettempdir(), f"hk-test-{os.getpid()}.log")
         os.environ["HARNESS_KIT_LOG"] = self.logfile
+        os.environ["HARNESS_KIT_RECORD_WAIT"] = "0"  # no re-reads, except in the race tests
         self.parent = os.path.realpath(self.tmp.name)  # not a repo
         self.a = os.path.join(self.parent, "app")
         self.b = os.path.join(self.parent, "blog")
@@ -56,6 +57,7 @@ class Record(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
         os.environ.pop("HARNESS_KIT_LOG", None)
+        os.environ.pop("HARNESS_KIT_RECORD_WAIT", None)
         if os.path.exists(self.logfile):
             os.unlink(self.logfile)
 
@@ -323,6 +325,80 @@ class Record(unittest.TestCase):
         out = self.run_record_from_transcript(self.parent, path)
         self.assertIn("did not approve", out)
         self.assertFalse(hk.is_approved(self.a))
+
+    def test_a_handback_written_after_the_hook_started_is_still_read(self):
+        # The race: the hook runs before the skeptic's SubagentHandback line is flushed.
+        import threading
+        fp = hk.fingerprint(self.a)
+        path = self.transcript(
+            ("assistant", [{"type": "tool_use", "name": "Bash", "input": {}}], "m1"),
+            ("user", [{"type": "tool_result", "content": "ok"}]),
+        )
+        line = {"type": "assistant", "message": {"role": "assistant", "id": "m2", "content": [
+            {"type": "tool_use", "name": "SubagentHandback", "input": {"message": verdict("approved", fp)}}]}}
+
+        def late_write():
+            with open(path, "a") as f:
+                f.write(json.dumps(line) + "\n")
+
+        os.environ["HARNESS_KIT_RECORD_WAIT"] = "5"
+        timer = threading.Timer(0.6, late_write)
+        timer.start()
+        try:
+            out = self.run_record_from_transcript(self.parent, path)
+        finally:
+            timer.join()
+        self.assertIn("approval recorded", out)
+        self.assertTrue(hk.is_approved(self.a))
+
+    def test_a_final_message_flushed_in_parts_is_read_only_once_its_handback_lands(self):
+        # The text line of the final message is on disk (stop_reason tool_use, as Claude Code writes it)
+        # with a draft verdict; the handback with the real one comes later. The draft must not count.
+        import threading
+        fp = hk.fingerprint(self.a)
+        path = os.path.join(self.parent, "agent.jsonl")
+        draft = {"type": "assistant", "message": {"role": "assistant", "id": "m9", "stop_reason": "tool_use",
+                                                  "content": [{"type": "text", "text": verdict("approved", fp)}]}}
+        final = {"type": "assistant", "message": {"role": "assistant", "id": "m9", "stop_reason": "tool_use",
+                                                  "content": [{"type": "tool_use", "name": "SubagentHandback",
+                                                               "input": {"message": verdict("rejected", fp)}}]}}
+        with open(path, "w") as f:
+            f.write(json.dumps(draft) + "\n")
+
+        def late_write():
+            with open(path, "a") as f:
+                f.write(json.dumps(final) + "\n")
+
+        hk.write_marker(self.a, fp)
+        os.environ["HARNESS_KIT_RECORD_WAIT"] = "5"
+        timer = threading.Timer(0.6, late_write)
+        timer.start()
+        try:
+            out = self.run_record_from_transcript(self.parent, path)
+        finally:
+            timer.join()
+        self.assertNotIn("approval recorded", out)
+        self.assertFalse(hk.is_approved(self.a))
+
+    def test_the_wait_is_capped_below_the_hook_timeout(self):
+        for value, want in (("inf", 50.0), ("nan", 0.0), ("-3", 0.0), ("x", 10.0)):
+            os.environ["HARNESS_KIT_RECORD_WAIT"] = value
+            with mock.patch.object(hk.time, "sleep") as sleep, \
+                    mock.patch.object(hk.time, "monotonic", side_effect=[0.0, *[i * 0.25 for i in range(1, 400)]]):
+                hk.transcript_report(os.path.join(self.parent, "missing.jsonl"))
+            self.assertAlmostEqual(sleep.call_count * 0.25, want, delta=0.5, msg=value)
+
+    def test_a_transcript_that_never_gets_a_verdict_gives_up_after_the_wait(self):
+        import time
+        path = self.transcript(("assistant", [{"type": "text", "text": "still thinking"}], "m1"))
+        os.environ["HARNESS_KIT_RECORD_WAIT"] = "0.6"
+        start = time.monotonic()
+        out = self.run_record_from_transcript(self.parent, path)
+        took = time.monotonic() - start
+        self.assertIn("did not approve", out)
+        self.assertFalse(hk.is_approved(self.a))
+        self.assertGreaterEqual(took, 0.5)
+        self.assertLess(took, 3)
 
     def test_the_text_lines_of_the_final_message_are_read_together(self):
         fp = hk.fingerprint(self.a)
