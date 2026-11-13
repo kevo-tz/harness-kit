@@ -12,6 +12,9 @@ Subcommands:
            below the session folder, whose current fingerprint equals REVIEWED.
            The final message comes from `last_assistant_message`, or from the
            transcript in `agent_transcript_path` when the harness sends only that.
+           A transcript without a VERDICT line yet is re-read for up to
+           HARNESS_KIT_RECORD_WAIT seconds (default 10, at most 50), since the harness can
+           run the hook before the final lines are written.
   hash     Print the fingerprint of the pending change (the skeptic runs this).
   approve  Human override: approve the current change by hand. Run it in your
            own terminal; Claude is blocked from running it.
@@ -34,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 MARKER = "claude-skeptic-approved"
 SELF = "harness-kit.py"
@@ -322,6 +326,30 @@ def head_of(root):
     return git(["rev-parse", "--verify", "-q", "HEAD"], root, check=False) or "unborn"
 
 
+VERDICT_RE = r"^\W*VERDICT\W*(approved|rejected)\b"
+
+
+def transcript_report(path):
+    """The final report from the transcript, re-read for a short while when it has no VERDICT line yet.
+
+    Claude Code can run the SubagentStop hook before it has flushed the skeptic's last lines (the
+    SubagentHandback) to the transcript; the hook then saw an earlier message and recorded nothing
+    (`verdicts=[]` in the log). Waiting up to HARNESS_KIT_RECORD_WAIT seconds (default 10, at most 50,
+    under the 60 s hook timeout) lets the write land. A report that is still missing after that is no
+    report, as before."""
+    msg = last_assistant_text(path)
+    try:
+        wait = float(os.environ.get("HARNESS_KIT_RECORD_WAIT", "10"))
+    except ValueError:
+        wait = 10.0
+    wait = min(max(wait, 0.0), 50.0) if wait == wait else 0.0  # NaN -> 0; capped below the hook timeout
+    deadline = time.monotonic() + wait
+    while path and not re.search(VERDICT_RE, msg, re.I | re.M) and time.monotonic() < deadline:
+        time.sleep(0.25)
+        msg = last_assistant_text(path)
+    return msg
+
+
 def record(data):
     agent = data.get("agent_type") or ""
     log(f"record agent_type={agent!r} cwd={data.get('cwd')!r} keys={sorted(data)}")
@@ -329,8 +357,9 @@ def record(data):
         return 0
     cwd = data.get("cwd") or os.getcwd()
     msg = data.get("last_assistant_message")
-    msg = msg if isinstance(msg, str) and msg.strip() else last_assistant_text(data.get("agent_transcript_path"))
-    verdicts = [v.lower() for v in re.findall(r"^\W*VERDICT\W*(approved|rejected)\b", msg, re.I | re.M)]
+    if not (isinstance(msg, str) and msg.strip()):
+        msg = transcript_report(data.get("agent_transcript_path"))
+    verdicts = [v.lower() for v in re.findall(VERDICT_RE, msg, re.I | re.M)]
     reviewed = re.findall(r"^\W*REVIEWED\W*([0-9a-z]+:[0-9a-f]+)", msg, re.I | re.M)
     # A finding is serious when a line starts with [blocker] or [major], after anything that is not a letter or
     # digit (list markers of any kind, dashes, bullets, "#", ">", "|", emphasis, emoji, spaces) and optionally
